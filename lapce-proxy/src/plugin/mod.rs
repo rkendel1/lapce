@@ -1,5 +1,7 @@
 pub mod catalog;
 pub mod dap;
+pub mod fabric;
+pub mod fabric_types;
 pub mod lsp;
 pub mod psp;
 pub mod wasi;
