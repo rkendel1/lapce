@@ -1,4 +1,8 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    fs,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use lapce_rpc::plugin::VoltMetadata;
 use serde_json::{Value, json};
@@ -45,6 +49,76 @@ fn test_load_volt() {
         panic!(
             "Unexpected result from `lapce_proxy::plugin::wasi::load_volt` function: {volt_metadata:?}"
         );
+    }
+
+    fn temp_plugin_dir(prefix: &str) -> std::path::PathBuf {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("lapce-{prefix}-{ts}"));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn test_load_volt_with_valid_fabric_capabilities() {
+        let dir = temp_plugin_dir("valid-fabric");
+        let toml = r#"
+    name = "test-plugin"
+    version = "0.1.0"
+    display-name = "Test Plugin"
+    author = "author"
+    description = "plugin with fabric"
+
+    [fabric]
+    [[fabric.capabilities]]
+    namespace = "language"
+    operation = "format"
+    language = "rust"
+    priority = 100
+
+    [[fabric.capabilities]]
+    namespace = "language"
+    operation = "format"
+    language = "rust"
+    priority = 80
+    "#;
+        fs::write(dir.join("volt.toml"), toml).unwrap();
+
+        let loaded = load_volt(&dir).unwrap();
+        let capabilities = &loaded.fabric.unwrap().capabilities;
+        assert_eq!(capabilities.len(), 1);
+        assert_eq!(capabilities[0].namespace, "language");
+        assert_eq!(capabilities[0].operation, "format");
+        assert_eq!(capabilities[0].language.as_deref(), Some("rust"));
+        assert_eq!(capabilities[0].priority, 100);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_load_volt_rejects_invalid_fabric_priority() {
+        let dir = temp_plugin_dir("invalid-fabric-priority");
+        let toml = r#"
+    name = "test-plugin"
+    version = "0.1.0"
+    display-name = "Test Plugin"
+    author = "author"
+    description = "plugin with fabric"
+
+    [fabric]
+    [[fabric.capabilities]]
+    namespace = "language"
+    operation = "format"
+    priority = 100000
+    "#;
+        fs::write(dir.join("volt.toml"), toml).unwrap();
+
+        let result = load_volt(&dir);
+        assert!(result.is_err());
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     // Invalid file (not readable into a string)
@@ -145,7 +219,8 @@ fn test_load_volt() {
             icon_themes: Some(icon_themes_pathes),
             dir: parent_path.canonicalize().ok(),
             activation: None,
-            config: None
+            config: None,
+            fabric: None,
         }
     );
 
@@ -205,7 +280,8 @@ fn test_load_volt() {
             icon_themes: Some(icon_themes_pathes),
             dir: parent_path.canonicalize().ok(),
             activation: None,
-            config: None
+            config: None,
+            fabric: None,
         }
     );
 
@@ -231,7 +307,8 @@ fn test_load_volt() {
             icon_themes: Some(Vec::new()),
             dir: parent_path.canonicalize().ok(),
             activation: None,
-            config: None
+            config: None,
+            fabric: None,
         }
     );
 }

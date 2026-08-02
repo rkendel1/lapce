@@ -29,6 +29,11 @@ use serde_json::Value;
 use super::{
     PluginCatalogNotification, PluginCatalogRpcHandler,
     dap::{DapClient, DapRpcHandler, DebuggerData},
+    fabric::WasmFabric,
+    fabric_types::{
+        FabricHealth, FabricModuleRegistration, FabricModuleState,
+        FabricRegistrationId,
+    },
     psp::{ClonableCallback, PluginServerRpc, PluginServerRpcHandler, RpcCallback},
     wasi::{load_all_volts, start_volt},
 };
@@ -45,6 +50,7 @@ pub struct PluginCatalog {
     plugin_configurations: HashMap<String, HashMap<String, serde_json::Value>>,
     unactivated_volts: HashMap<VoltID, VoltMetadata>,
     open_files: HashMap<PathBuf, String>,
+    fabric: Arc<WasmFabric>,
 }
 
 impl PluginCatalog {
@@ -64,6 +70,7 @@ impl PluginCatalog {
             debuggers: HashMap::new(),
             unactivated_volts: HashMap::new(),
             open_files: HashMap::new(),
+            fabric: Arc::new(WasmFabric::new()),
         };
 
         thread::spawn(move || {
@@ -182,10 +189,17 @@ impl PluginCatalog {
         f: Box<dyn ClonableCallback<Value, RpcError>>,
     ) {
         let id = volt.id();
-        for (plugin_id, plugin) in self.plugins.iter() {
-            if plugin.volt_id == id {
+        let ids: Vec<PluginId> = self
+            .plugins
+            .iter()
+            .filter_map(|(plugin_id, plugin)| {
+                (plugin.volt_id == id).then_some(*plugin_id)
+            })
+            .collect();
+
+        for plugin_id in ids {
+            if let Some(plugin) = self.plugins.remove(&plugin_id) {
                 let f = dyn_clone::clone_box(&*f);
-                let plugin_id = *plugin_id;
                 plugin.server_request_async(
                     lsp_types::request::Shutdown::METHOD,
                     Value::Null,
@@ -196,9 +210,59 @@ impl PluginCatalog {
                         f(plugin_id, result);
                     },
                 );
+                self.update_fabric_state(&plugin, FabricModuleState::Stopping);
                 plugin.shutdown();
+                self.unregister_from_fabric(
+                    plugin.plugin_id,
+                    plugin.fabric_registration_id,
+                );
             }
         }
+    }
+
+    fn register_plugin_in_fabric(&self, plugin: &mut PluginServerRpcHandler) {
+        let registration = FabricModuleRegistration::new(
+            plugin.plugin_id,
+            plugin.volt_id.clone(),
+            plugin.volt_id.name.clone(),
+        )
+        .state(FabricModuleState::Starting)
+        .health(FabricHealth::Unknown)
+        .capabilities(plugin.fabric_capabilities.clone());
+        let registration_id = self.fabric.register(registration);
+        plugin.fabric_registration_id = Some(registration_id);
+        self.fabric.update_state(
+            plugin.plugin_id,
+            registration_id,
+            FabricModuleState::Ready,
+        );
+    }
+
+    fn update_fabric_state(
+        &self,
+        plugin: &PluginServerRpcHandler,
+        state: FabricModuleState,
+    ) {
+        if let Some(registration_id) = plugin.fabric_registration_id {
+            let _ =
+                self.fabric
+                    .update_state(plugin.plugin_id, registration_id, state);
+        }
+    }
+
+    fn unregister_from_fabric(
+        &self,
+        plugin_id: PluginId,
+        registration_id: Option<FabricRegistrationId>,
+    ) {
+        if let Some(registration_id) = registration_id {
+            let _ = self.fabric.unregister(plugin_id, registration_id);
+        }
+    }
+
+    fn mark_failed_and_unregister(&self, plugin: &PluginServerRpcHandler) {
+        self.update_fabric_state(plugin, FabricModuleState::Failed);
+        self.unregister_from_fabric(plugin.plugin_id, plugin.fabric_registration_id);
     }
 
     fn start_unactivated_volts(&mut self, to_be_activated: Vec<VoltID>) {
@@ -488,7 +552,7 @@ impl PluginCatalog {
                 tracing::debug!("UpdatePluginConfigs {:?}", configs);
                 self.plugin_configurations = configs;
             }
-            PluginServerLoaded(plugin) => {
+            PluginServerLoaded(mut plugin) => {
                 // TODO: check if the server has did open registered
                 match self.plugin_rpc.proxy_rpc.get_open_files_content() {
                     Ok(ProxyResponse::GetOpenFilesContentResponse { items }) => {
@@ -514,6 +578,7 @@ impl PluginCatalog {
 
                 let plugin_id = plugin.plugin_id;
                 let spawned_by = plugin.spawned_by;
+                self.register_plugin_in_fabric(&mut plugin);
 
                 self.plugins.insert(plugin.plugin_id, plugin);
 
@@ -525,6 +590,20 @@ impl PluginCatalog {
                             },
                         ));
                     }
+                }
+            }
+            PluginServerFailed(plugin_id) => {
+                if let Some(plugin) = self.plugins.remove(&plugin_id) {
+                    self.mark_failed_and_unregister(&plugin);
+                    plugin.shutdown();
+                }
+            }
+            PluginServerStopped(plugin_id) => {
+                if let Some(plugin) = self.plugins.remove(&plugin_id) {
+                    self.unregister_from_fabric(
+                        plugin.plugin_id,
+                        plugin.fabric_registration_id,
+                    );
                 }
             }
             InstallVolt(volt) => {
@@ -549,7 +628,15 @@ impl PluginCatalog {
                 for id in ids {
                     if self.plugins.get(&id).unwrap().volt_id == volt_id {
                         let plugin = self.plugins.remove(&id).unwrap();
+                        self.update_fabric_state(
+                            &plugin,
+                            FabricModuleState::Stopping,
+                        );
                         plugin.shutdown();
+                        self.unregister_from_fabric(
+                            plugin.plugin_id,
+                            plugin.fabric_registration_id,
+                        );
                     }
                 }
                 if let Err(err) = self.plugin_rpc.unactivated_volts(vec![volt]) {
@@ -563,7 +650,15 @@ impl PluginCatalog {
                 for id in ids {
                     if self.plugins.get(&id).unwrap().volt_id == volt_id {
                         let plugin = self.plugins.remove(&id).unwrap();
+                        self.update_fabric_state(
+                            &plugin,
+                            FabricModuleState::Stopping,
+                        );
                         plugin.shutdown();
+                        self.unregister_from_fabric(
+                            plugin.plugin_id,
+                            plugin.fabric_registration_id,
+                        );
                     }
                 }
             }
@@ -747,8 +842,19 @@ impl PluginCatalog {
                 );
             }
             Shutdown => {
-                for (_, plugin) in self.plugins.iter() {
-                    plugin.shutdown();
+                let ids: Vec<PluginId> = self.plugins.keys().cloned().collect();
+                for id in ids {
+                    if let Some(plugin) = self.plugins.remove(&id) {
+                        self.update_fabric_state(
+                            &plugin,
+                            FabricModuleState::Stopping,
+                        );
+                        plugin.shutdown();
+                        self.unregister_from_fabric(
+                            plugin.plugin_id,
+                            plugin.fabric_registration_id,
+                        );
+                    }
                 }
             }
         }

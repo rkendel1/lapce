@@ -62,6 +62,7 @@ use serde_json::Value;
 
 use super::{
     PluginCatalogRpcHandler,
+    fabric_types::{FabricRegistrationId, RegisteredCapability},
     lsp::{DocumentFilter, LspClient},
 };
 
@@ -174,6 +175,8 @@ pub struct PluginServerRpcHandler {
     pub spawned_by: Option<PluginId>,
     pub plugin_id: PluginId,
     pub volt_id: VoltID,
+    pub fabric_registration_id: Option<FabricRegistrationId>,
+    pub fabric_capabilities: Vec<RegisteredCapability>,
     rpc_tx: Sender<PluginServerRpc>,
     rpc_rx: Receiver<PluginServerRpc>,
     io_tx: Sender<JsonRpc>,
@@ -282,6 +285,8 @@ impl PluginServerRpcHandler {
             spawned_by,
             volt_id,
             plugin_id: plugin_id.unwrap_or_else(PluginId::next),
+            fabric_registration_id: None,
+            fabric_capabilities: Vec::new(),
             rpc_tx,
             rpc_rx,
             io_tx,
@@ -627,7 +632,7 @@ pub struct PluginHostHandler {
     pub(crate) workspace: Option<PathBuf>,
     document_selector: Vec<DocumentFilter>,
     core_rpc: CoreRpcHandler,
-    catalog_rpc: PluginCatalogRpcHandler,
+    pub(crate) catalog_rpc: PluginCatalogRpcHandler,
     pub server_rpc: PluginServerRpcHandler,
     pub server_capabilities: ServerCapabilities,
     server_registrations: ServerRegistrations,
