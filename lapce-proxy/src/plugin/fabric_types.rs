@@ -3,13 +3,46 @@ use std::fmt;
 use lapce_rpc::plugin::{PluginId, VoltID};
 use serde::{Deserialize, Serialize};
 
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum FabricApiVersion {
+    V1,
+}
+
+impl Default for FabricApiVersion {
+    fn default() -> Self {
+        Self::V1
+    }
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum CapabilitySource {
+    VoltManifest,
+    PluginRuntime,
+    HostDerived,
+    Test,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct FabricCapability {
+pub struct CapabilityKey {
     pub namespace: String,
     pub operation: String,
     #[serde(default)]
     pub language: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FabricCapability {
+    #[serde(default)]
+    pub api_version: FabricApiVersion,
+    pub key: CapabilityKey,
     #[serde(default)]
     pub priority: i32,
 }
@@ -17,15 +50,18 @@ pub struct FabricCapability {
 impl FabricCapability {
     pub fn new(namespace: impl Into<String>, operation: impl Into<String>) -> Self {
         Self {
-            namespace: namespace.into(),
-            operation: operation.into(),
-            language: None,
+            api_version: FabricApiVersion::V1,
+            key: CapabilityKey {
+                namespace: namespace.into(),
+                operation: operation.into(),
+                language: None,
+            },
             priority: 0,
         }
     }
 
     pub fn language(mut self, language: impl Into<String>) -> Self {
-        self.language = Some(language.into());
+        self.key.language = Some(language.into());
         self
     }
 
@@ -35,12 +71,13 @@ impl FabricCapability {
     }
 
     pub fn matches(&self, request: &FabricRequest) -> bool {
-        if self.namespace != request.namespace || self.operation != request.operation
+        if self.key.namespace != request.namespace
+            || self.key.operation != request.operation
         {
             return false;
         }
 
-        match (self.language.as_deref(), request.language.as_deref()) {
+        match (self.key.language.as_deref(), request.language.as_deref()) {
             (None, _) => true,
             (Some("*"), _) => true,
             (Some(_), None) => false,
@@ -51,7 +88,7 @@ impl FabricCapability {
     }
 
     pub fn specificity(&self, request: &FabricRequest) -> u8 {
-        match (self.language.as_deref(), request.language.as_deref()) {
+        match (self.key.language.as_deref(), request.language.as_deref()) {
             (Some(capability_language), Some(request_language))
                 if capability_language == request_language =>
             {
@@ -61,6 +98,19 @@ impl FabricCapability {
             (None, _) => 1,
             _ => 0,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegisteredCapability {
+    pub capability: FabricCapability,
+    pub source: CapabilitySource,
+}
+
+impl RegisteredCapability {
+    pub fn new(capability: FabricCapability, source: CapabilitySource) -> Self {
+        Self { capability, source }
     }
 }
 
@@ -146,7 +196,7 @@ pub struct FabricModuleRegistration {
     pub plugin_id: PluginId,
     pub volt_id: VoltID,
     pub name: String,
-    pub capabilities: Vec<FabricCapability>,
+    pub capabilities: Vec<RegisteredCapability>,
     pub state: FabricModuleState,
     pub health: FabricHealth,
 }
@@ -167,7 +217,7 @@ impl FabricModuleRegistration {
         }
     }
 
-    pub fn capabilities(mut self, capabilities: Vec<FabricCapability>) -> Self {
+    pub fn capabilities(mut self, capabilities: Vec<RegisteredCapability>) -> Self {
         self.capabilities = capabilities;
         self
     }
@@ -201,7 +251,7 @@ pub struct FabricCandidate {
     pub plugin_id: PluginId,
     pub volt_id: VoltID,
     pub name: String,
-    pub capability: FabricCapability,
+    pub capability: RegisteredCapability,
     pub state: FabricModuleState,
     pub health: FabricHealth,
 }
@@ -225,7 +275,7 @@ pub struct FabricModuleSnapshot {
     pub plugin_id: PluginId,
     pub volt_id: VoltID,
     pub name: String,
-    pub capabilities: Vec<FabricCapability>,
+    pub capabilities: Vec<RegisteredCapability>,
     pub state: FabricModuleState,
     pub health: FabricHealth,
 }

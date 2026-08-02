@@ -2,8 +2,8 @@ use std::{
     cmp::Ordering,
     collections::HashMap,
     sync::{
-        atomic::{AtomicU64, Ordering as AtomicOrdering},
         Arc,
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
     },
 };
 
@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 use super::fabric_types::{
     FabricCandidate, FabricEvent, FabricHealth, FabricModuleRegistration,
     FabricModuleSnapshot, FabricModuleState, FabricRegistrationId, FabricRequest,
-    FabricRoute, FabricSnapshot,
+    FabricRoute, FabricSnapshot, RegisteredCapability,
 };
 
 pub type SharedFabric = Arc<WasmFabric>;
@@ -23,6 +23,7 @@ pub struct WasmFabric {
     inner: RwLock<FabricInner>,
     next_registration_id: AtomicU64,
     next_generation: AtomicU64,
+    routing_policy: Arc<dyn FabricRoutingPolicy>,
 }
 
 #[derive(Default)]
@@ -38,9 +39,41 @@ struct FabricModuleRecord {
     plugin_id: PluginId,
     volt_id: lapce_rpc::plugin::VoltID,
     name: String,
-    capabilities: Vec<super::fabric_types::FabricCapability>,
+    capabilities: Vec<RegisteredCapability>,
     state: FabricModuleState,
     health: FabricHealth,
+}
+
+pub trait FabricRoutingPolicy: Send + Sync {
+    fn rank(
+        &self,
+        request: &FabricRequest,
+        candidate: &FabricCandidate,
+    ) -> FabricCandidateScore;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FabricCandidateScore {
+    pub health: u8,
+    pub specificity: u8,
+    pub priority: i32,
+}
+
+#[derive(Default)]
+pub struct DefaultFabricRoutingPolicy;
+
+impl FabricRoutingPolicy for DefaultFabricRoutingPolicy {
+    fn rank(
+        &self,
+        request: &FabricRequest,
+        candidate: &FabricCandidate,
+    ) -> FabricCandidateScore {
+        FabricCandidateScore {
+            health: candidate.health.routing_rank(),
+            specificity: candidate.capability.capability.specificity(request),
+            priority: candidate.capability.capability.priority,
+        }
+    }
 }
 
 impl Default for WasmFabric {
@@ -51,10 +84,15 @@ impl Default for WasmFabric {
 
 impl WasmFabric {
     pub fn new() -> Self {
+        Self::with_policy(Arc::new(DefaultFabricRoutingPolicy))
+    }
+
+    pub fn with_policy(policy: Arc<dyn FabricRoutingPolicy>) -> Self {
         Self {
             inner: RwLock::new(FabricInner::default()),
             next_registration_id: AtomicU64::new(1),
             next_generation: AtomicU64::new(1),
+            routing_policy: policy,
         }
     }
 
@@ -167,7 +205,7 @@ impl WasmFabric {
         &self,
         plugin_id: PluginId,
         registration_id: FabricRegistrationId,
-        capabilities: Vec<super::fabric_types::FabricCapability>,
+        capabilities: Vec<RegisteredCapability>,
     ) -> bool {
         self.update_module(plugin_id, registration_id, |module| {
             module.capabilities = capabilities;
@@ -186,7 +224,7 @@ impl WasmFabric {
             let Some(capability) = module
                 .capabilities
                 .iter()
-                .filter(|capability| capability.matches(&request))
+                .filter(|capability| capability.capability.matches(&request))
                 .max_by(|left, right| compare_capabilities(left, right, &request))
                 .cloned()
             else {
@@ -204,7 +242,9 @@ impl WasmFabric {
             });
         }
 
-        candidates.sort_by(|left, right| compare_candidates(left, right, &request));
+        candidates.sort_by(|left, right| {
+            compare_candidates(left, right, &request, self.routing_policy.as_ref())
+        });
 
         if let Some(selected) = candidates.first().cloned() {
             let route = FabricRoute {
@@ -296,56 +336,72 @@ impl WasmFabric {
 }
 
 fn compare_capabilities(
-    left: &super::fabric_types::FabricCapability,
-    right: &super::fabric_types::FabricCapability,
+    left: &RegisteredCapability,
+    right: &RegisteredCapability,
     request: &FabricRequest,
 ) -> Ordering {
-    left.specificity(request)
-        .cmp(&right.specificity(request))
-        .then_with(|| left.priority.cmp(&right.priority))
-        .then_with(|| left.language.cmp(&right.language))
-        .then_with(|| left.namespace.cmp(&right.namespace))
-        .then_with(|| left.operation.cmp(&right.operation))
+    left.capability
+        .specificity(request)
+        .cmp(&right.capability.specificity(request))
+        .then_with(|| left.capability.priority.cmp(&right.capability.priority))
+        .then_with(|| {
+            left.capability
+                .key
+                .language
+                .cmp(&right.capability.key.language)
+        })
+        .then_with(|| {
+            left.capability
+                .key
+                .namespace
+                .cmp(&right.capability.key.namespace)
+        })
+        .then_with(|| {
+            left.capability
+                .key
+                .operation
+                .cmp(&right.capability.key.operation)
+        })
 }
 
 fn compare_candidates(
     left: &FabricCandidate,
     right: &FabricCandidate,
     request: &FabricRequest,
+    routing_policy: &dyn FabricRoutingPolicy,
 ) -> Ordering {
-    right
-        .health
-        .routing_rank()
-        .cmp(&left.health.routing_rank())
-        .then_with(|| {
-            right
-                .capability
-                .specificity(request)
-                .cmp(&left.capability.specificity(request))
-        })
-        .then_with(|| right.capability.priority.cmp(&left.capability.priority))
+    routing_policy
+        .rank(request, right)
+        .cmp(&routing_policy.rank(request, left))
         .then_with(|| left.plugin_id.0.cmp(&right.plugin_id.0))
         .then_with(|| left.registration_id.cmp(&right.registration_id))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use lapce_rpc::plugin::{PluginId, VoltID};
 
     use super::{
         super::fabric_types::{
-            FabricCapability, FabricHealth, FabricModuleRegistration,
-            FabricModuleState, FabricRequest,
+            CapabilitySource, FabricCapability, FabricHealth,
+            FabricModuleRegistration, FabricModuleState, FabricRequest,
+            RegisteredCapability,
         },
-        WasmFabric,
+        DefaultFabricRoutingPolicy, WasmFabric,
     };
+
+    fn manifest_capability(capability: FabricCapability) -> RegisteredCapability {
+        RegisteredCapability::new(capability, CapabilitySource::VoltManifest)
+    }
 
     fn registration(
         plugin_id: u64,
         name: &str,
         state: FabricModuleState,
         health: FabricHealth,
-        capabilities: Vec<FabricCapability>,
+        capabilities: Vec<RegisteredCapability>,
     ) -> FabricModuleRegistration {
         FabricModuleRegistration::new(
             PluginId(plugin_id),
@@ -369,7 +425,9 @@ mod tests {
             "generic",
             FabricModuleState::Ready,
             FabricHealth::Healthy,
-            vec![FabricCapability::new("language", "format")],
+            vec![manifest_capability(FabricCapability::new(
+                "language", "format",
+            ))],
         ));
 
         fabric.register(registration(
@@ -377,7 +435,9 @@ mod tests {
             "wildcard",
             FabricModuleState::Ready,
             FabricHealth::Healthy,
-            vec![FabricCapability::new("language", "format").language("*")],
+            vec![manifest_capability(
+                FabricCapability::new("language", "format").language("*"),
+            )],
         ));
 
         fabric.register(registration(
@@ -385,7 +445,9 @@ mod tests {
             "exact",
             FabricModuleState::Ready,
             FabricHealth::Healthy,
-            vec![FabricCapability::new("language", "format").language("rust")],
+            vec![manifest_capability(
+                FabricCapability::new("language", "format").language("rust"),
+            )],
         ));
 
         let route = fabric
@@ -412,7 +474,9 @@ mod tests {
             "degraded-high-priority",
             FabricModuleState::Ready,
             FabricHealth::Degraded,
-            vec![FabricCapability::new("language", "format").priority(99)],
+            vec![manifest_capability(
+                FabricCapability::new("language", "format").priority(99),
+            )],
         ));
 
         fabric.register(registration(
@@ -420,7 +484,9 @@ mod tests {
             "healthy-lower-priority",
             FabricModuleState::Ready,
             FabricHealth::Healthy,
-            vec![FabricCapability::new("language", "format").priority(1)],
+            vec![manifest_capability(
+                FabricCapability::new("language", "format").priority(1),
+            )],
         ));
 
         let route = fabric
@@ -439,7 +505,9 @@ mod tests {
             "starting",
             FabricModuleState::Starting,
             FabricHealth::Healthy,
-            vec![FabricCapability::new("language", "format")],
+            vec![manifest_capability(FabricCapability::new(
+                "language", "format",
+            ))],
         ));
 
         fabric.register(registration(
@@ -447,12 +515,16 @@ mod tests {
             "unhealthy",
             FabricModuleState::Ready,
             FabricHealth::Unhealthy,
-            vec![FabricCapability::new("language", "format")],
+            vec![manifest_capability(FabricCapability::new(
+                "language", "format",
+            ))],
         ));
 
-        assert!(fabric
-            .route(FabricRequest::new("language", "format"))
-            .is_none());
+        assert!(
+            fabric
+                .route(FabricRequest::new("language", "format"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -465,7 +537,9 @@ mod tests {
             "module",
             FabricModuleState::Ready,
             FabricHealth::Healthy,
-            vec![FabricCapability::new("language", "format")],
+            vec![manifest_capability(FabricCapability::new(
+                "language", "format",
+            ))],
         ));
 
         let second_registration = fabric.register(registration(
@@ -473,7 +547,9 @@ mod tests {
             "module-new",
             FabricModuleState::Ready,
             FabricHealth::Healthy,
-            vec![FabricCapability::new("language", "format")],
+            vec![manifest_capability(FabricCapability::new(
+                "language", "format",
+            ))],
         ));
 
         assert_ne!(first_registration, second_registration);
@@ -494,7 +570,9 @@ mod tests {
             "stateful",
             FabricModuleState::Ready,
             FabricHealth::Unknown,
-            vec![FabricCapability::new("language", "format")],
+            vec![manifest_capability(FabricCapability::new(
+                "language", "format",
+            ))],
         ));
 
         assert!(!fabric.update_state(
@@ -512,5 +590,42 @@ mod tests {
         let snapshot = fabric.snapshot();
         assert_eq!(snapshot.modules[0].health, FabricHealth::Healthy);
         assert_eq!(snapshot.modules[0].state, FabricModuleState::Ready);
+    }
+
+    #[test]
+    fn default_routing_policy_matches_default_constructor() {
+        let with_default_ctor = WasmFabric::new();
+        let with_policy =
+            WasmFabric::with_policy(Arc::new(DefaultFabricRoutingPolicy));
+
+        let registration = registration(
+            10,
+            "formatter",
+            FabricModuleState::Ready,
+            FabricHealth::Healthy,
+            vec![manifest_capability(
+                FabricCapability::new("language", "format").language("rust"),
+            )],
+        );
+        let registration2 = registration(
+            11,
+            "fallback",
+            FabricModuleState::Ready,
+            FabricHealth::Unknown,
+            vec![manifest_capability(FabricCapability::new(
+                "language", "format",
+            ))],
+        );
+
+        with_default_ctor.register(registration.clone());
+        with_default_ctor.register(registration2.clone());
+        with_policy.register(registration);
+        with_policy.register(registration2);
+
+        let request = FabricRequest::new("language", "format").language("rust");
+        let route_a = with_default_ctor.route(request.clone()).unwrap();
+        let route_b = with_policy.route(request).unwrap();
+        assert_eq!(route_a.selected.plugin_id, route_b.selected.plugin_id);
+        assert_eq!(route_a.candidates.len(), route_b.candidates.len());
     }
 }

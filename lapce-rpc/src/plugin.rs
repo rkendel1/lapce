@@ -55,6 +55,43 @@ pub struct VoltConfig {
     pub description: String,
 }
 
+pub const VOLT_FABRIC_PRIORITY_MIN: i32 = -1000;
+pub const VOLT_FABRIC_PRIORITY_MAX: i32 = 1000;
+
+#[derive(
+    Deserialize, Clone, Copy, Debug, Serialize, PartialEq, Eq, Hash, PartialOrd, Ord,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum VoltFabricApiVersion {
+    V1,
+}
+
+impl Default for VoltFabricApiVersion {
+    fn default() -> Self {
+        Self::V1
+    }
+}
+
+#[derive(Deserialize, Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub struct VoltFabricCapability {
+    pub namespace: String,
+    pub operation: String,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub priority: i32,
+    #[serde(default)]
+    pub api_version: VoltFabricApiVersion,
+}
+
+#[derive(Deserialize, Clone, Debug, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct VoltFabric {
+    #[serde(default)]
+    pub capabilities: Vec<VoltFabricCapability>,
+}
+
 #[derive(Deserialize, Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub struct VoltMetadata {
@@ -71,6 +108,7 @@ pub struct VoltMetadata {
     pub dir: Option<PathBuf>,
     pub activation: Option<VoltActivation>,
     pub config: Option<HashMap<String, VoltConfig>>,
+    pub fabric: Option<VoltFabric>,
 }
 
 impl VoltMetadata {
@@ -160,6 +198,7 @@ mod tests {
             dir: std::env::current_dir().unwrap().canonicalize().ok(),
             activation: None,
             config: None,
+            fabric: None,
         };
         let volt_id = VoltID {
             author: "Author".to_string(),
@@ -198,6 +237,7 @@ mod tests {
             dir: std::env::current_dir().unwrap().canonicalize().ok(),
             activation: None,
             config: None,
+            fabric: None,
         };
         let volt_info = VoltInfo {
             name: "plugin".to_string(),

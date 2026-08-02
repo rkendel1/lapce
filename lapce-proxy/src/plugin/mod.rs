@@ -159,6 +159,8 @@ pub enum PluginCatalogNotification {
     UpdatePluginConfigs(HashMap<String, HashMap<String, serde_json::Value>>),
     UnactivatedVolts(Vec<VoltMetadata>),
     PluginServerLoaded(PluginServerRpcHandler),
+    PluginServerFailed(PluginId),
+    PluginServerStopped(PluginId),
     InstallVolt(VoltInfo),
     StopVolt(VoltInfo),
     EnableVolt(VoltInfo),
@@ -1316,6 +1318,18 @@ impl PluginCatalogRpcHandler {
     ) -> Result<()> {
         self.catalog_notification(PluginCatalogNotification::PluginServerLoaded(
             plugin,
+        ))
+    }
+
+    pub fn plugin_server_failed(&self, plugin_id: PluginId) -> Result<()> {
+        self.catalog_notification(PluginCatalogNotification::PluginServerFailed(
+            plugin_id,
+        ))
+    }
+
+    pub fn plugin_server_stopped(&self, plugin_id: PluginId) -> Result<()> {
+        self.catalog_notification(PluginCatalogNotification::PluginServerStopped(
+            plugin_id,
         ))
     }
 

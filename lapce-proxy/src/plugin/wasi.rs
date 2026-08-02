@@ -2,7 +2,7 @@
 mod tests;
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     fs,
     io::{Read, Seek, Write},
     path::{Path, PathBuf},
@@ -16,7 +16,10 @@ use jsonrpc_lite::{Id, Params};
 use lapce_core::directory::Directory;
 use lapce_rpc::{
     RpcError,
-    plugin::{PluginId, VoltID, VoltInfo, VoltMetadata},
+    plugin::{
+        PluginId, VOLT_FABRIC_PRIORITY_MAX, VOLT_FABRIC_PRIORITY_MIN, VoltID,
+        VoltInfo, VoltMetadata,
+    },
     style::LineStyle,
 };
 use lapce_xi_rope::{Rope, RopeDelta};
@@ -34,6 +37,9 @@ use wasmtime_wasi::WasiCtxBuilder;
 
 use super::{
     PluginCatalogRpcHandler, client_capabilities,
+    fabric_types::{
+        CapabilitySource, FabricApiVersion, FabricCapability, RegisteredCapability,
+    },
     psp::{
         PluginHandlerNotification, PluginHostHandler, PluginServerHandler,
         PluginServerRpc, ResponseSender, RpcCallback, handle_plugin_server_message,
@@ -236,6 +242,13 @@ impl Plugin {
                 }
                 Err(err) => {
                     tracing::error!("{:?}", err);
+                    if let Err(catalog_err) = self
+                        .host
+                        .catalog_rpc
+                        .plugin_server_failed(self.host.server_rpc.plugin_id)
+                    {
+                        tracing::error!("{:?}", catalog_err);
+                    }
                 }
             },
         );
@@ -325,6 +338,122 @@ pub fn find_all_volts(extra_plugin_paths: &[PathBuf]) -> Vec<VoltMetadata> {
     plugins
 }
 
+fn normalize_fabric_capabilities(meta: &mut VoltMetadata) -> Result<()> {
+    let Some(fabric) = meta.fabric.as_mut() else {
+        return Ok(());
+    };
+
+    let mut deduped = BTreeMap::new();
+    for capability in fabric.capabilities.iter() {
+        let namespace = capability.namespace.trim().to_string();
+        let operation = capability.operation.trim().to_string();
+        let language = capability.language.as_ref().map(|s| s.trim().to_string());
+
+        if namespace.is_empty() {
+            return Err(anyhow!(
+                "invalid fabric capability in {}.{}: namespace is required",
+                meta.author,
+                meta.name
+            ));
+        }
+        if operation.is_empty() {
+            return Err(anyhow!(
+                "invalid fabric capability in {}.{}: operation is required",
+                meta.author,
+                meta.name
+            ));
+        }
+        if namespace == "*" || operation == "*" {
+            return Err(anyhow!(
+                "invalid fabric capability in {}.{}: wildcard is not supported for namespace/operation",
+                meta.author,
+                meta.name
+            ));
+        }
+        if let Some(language) = language.as_deref() {
+            if language.is_empty() {
+                return Err(anyhow!(
+                    "invalid fabric capability in {}.{}: language cannot be empty",
+                    meta.author,
+                    meta.name
+                ));
+            }
+        }
+        if capability.priority < VOLT_FABRIC_PRIORITY_MIN
+            || capability.priority > VOLT_FABRIC_PRIORITY_MAX
+        {
+            return Err(anyhow!(
+                "invalid fabric capability in {}.{}: priority {} out of bounds [{}, {}]",
+                meta.author,
+                meta.name,
+                capability.priority,
+                VOLT_FABRIC_PRIORITY_MIN,
+                VOLT_FABRIC_PRIORITY_MAX
+            ));
+        }
+
+        let key = (namespace, operation, language, capability.api_version);
+        match deduped.get_mut(&key) {
+            Some(priority) => {
+                *priority = (*priority).max(capability.priority);
+            }
+            None => {
+                deduped.insert(key, capability.priority);
+            }
+        }
+    }
+
+    fabric.capabilities = deduped
+        .into_iter()
+        .map(
+            |((namespace, operation, language, api_version), priority)| {
+                lapce_rpc::plugin::VoltFabricCapability {
+                    namespace,
+                    operation,
+                    language,
+                    priority,
+                    api_version,
+                }
+            },
+        )
+        .collect();
+
+    Ok(())
+}
+
+fn fabric_capabilities_from_manifest(
+    meta: &VoltMetadata,
+) -> Vec<RegisteredCapability> {
+    meta.fabric
+        .as_ref()
+        .map(|fabric| {
+            fabric
+                .capabilities
+                .iter()
+                .map(|capability| {
+                    let mut fabric_capability = FabricCapability::new(
+                        capability.namespace.clone(),
+                        capability.operation.clone(),
+                    )
+                    .priority(capability.priority);
+                    fabric_capability.api_version = match capability.api_version {
+                        lapce_rpc::plugin::VoltFabricApiVersion::V1 => {
+                            FabricApiVersion::V1
+                        }
+                    };
+                    if let Some(language) = capability.language.clone() {
+                        fabric_capability = fabric_capability.language(language);
+                    }
+                    RegisteredCapability::new(
+                        fabric_capability,
+                        CapabilitySource::VoltManifest,
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Returns an instance of "VoltMetadata" or an error if there is no file in the path,
 /// the contents of the file cannot be read into a string, or the content read cannot
 /// be converted to an instance of "VoltMetadata".
@@ -361,7 +490,8 @@ pub fn find_all_volts(extra_plugin_paths: &[PathBuf]) -> Vec<VoltMetadata> {
 ///         icon_themes: None,
 ///         dir: parent_path.canonicalize().ok(),
 ///         activation: None,
-///         config: None
+///         config: None,
+///         fabric: None,
 ///     }
 /// );
 /// let _ = std::fs::remove_file(parent_path.join("volt.toml"));
@@ -372,6 +502,7 @@ pub fn load_volt(path: &Path) -> Result<VoltMetadata> {
     let mut contents = String::new();
     file.read_to_string(&mut contents)?;
     let mut meta: VoltMetadata = toml::from_str(&contents)?;
+    normalize_fabric_capabilities(&mut meta)?;
 
     meta.dir = Some(path.clone());
     meta.wasm = meta.wasm.as_ref().and_then(|wasm| {
@@ -495,7 +626,8 @@ pub fn start_volt(
     let mut store = wasmtime::Store::new(&engine, wasi);
 
     let (io_tx, io_rx) = crossbeam_channel::unbounded();
-    let rpc = PluginServerRpcHandler::new(meta.id(), None, None, io_tx);
+    let mut rpc = PluginServerRpcHandler::new(meta.id(), None, None, io_tx);
+    rpc.fabric_capabilities = fabric_capabilities_from_manifest(&meta);
 
     let local_rpc = rpc.clone();
     let local_stdin = stdin.clone();
@@ -592,8 +724,12 @@ pub fn start_volt(
         configurations,
     };
     let local_rpc = rpc.clone();
+    let catalog_rpc = plugin_rpc.clone();
     thread::spawn(move || {
         local_rpc.mainloop(&mut plugin);
+        if let Err(err) = catalog_rpc.plugin_server_stopped(local_rpc.plugin_id) {
+            tracing::error!("{:?}", err);
+        }
     });
 
     if plugin_rpc.plugin_server_loaded(rpc.clone()).is_err() {
