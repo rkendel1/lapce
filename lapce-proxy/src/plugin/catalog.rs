@@ -210,8 +210,12 @@ impl PluginCatalog {
                         f(plugin_id, result);
                     },
                 );
-                self.mark_stopping_and_unregister(&plugin);
+                self.update_fabric_state(&plugin, FabricModuleState::Stopping);
                 plugin.shutdown();
+                self.unregister_from_fabric(
+                    plugin.plugin_id,
+                    plugin.fabric_registration_id,
+                );
             }
         }
     }
@@ -254,11 +258,6 @@ impl PluginCatalog {
         if let Some(registration_id) = registration_id {
             let _ = self.fabric.unregister(plugin_id, registration_id);
         }
-    }
-
-    fn mark_stopping_and_unregister(&self, plugin: &PluginServerRpcHandler) {
-        self.update_fabric_state(plugin, FabricModuleState::Stopping);
-        self.unregister_from_fabric(plugin.plugin_id, plugin.fabric_registration_id);
     }
 
     fn mark_failed_and_unregister(&self, plugin: &PluginServerRpcHandler) {
@@ -629,8 +628,15 @@ impl PluginCatalog {
                 for id in ids {
                     if self.plugins.get(&id).unwrap().volt_id == volt_id {
                         let plugin = self.plugins.remove(&id).unwrap();
-                        self.mark_stopping_and_unregister(&plugin);
+                        self.update_fabric_state(
+                            &plugin,
+                            FabricModuleState::Stopping,
+                        );
                         plugin.shutdown();
+                        self.unregister_from_fabric(
+                            plugin.plugin_id,
+                            plugin.fabric_registration_id,
+                        );
                     }
                 }
                 if let Err(err) = self.plugin_rpc.unactivated_volts(vec![volt]) {
@@ -644,8 +650,15 @@ impl PluginCatalog {
                 for id in ids {
                     if self.plugins.get(&id).unwrap().volt_id == volt_id {
                         let plugin = self.plugins.remove(&id).unwrap();
-                        self.mark_stopping_and_unregister(&plugin);
+                        self.update_fabric_state(
+                            &plugin,
+                            FabricModuleState::Stopping,
+                        );
                         plugin.shutdown();
+                        self.unregister_from_fabric(
+                            plugin.plugin_id,
+                            plugin.fabric_registration_id,
+                        );
                     }
                 }
             }
@@ -832,8 +845,15 @@ impl PluginCatalog {
                 let ids: Vec<PluginId> = self.plugins.keys().cloned().collect();
                 for id in ids {
                     if let Some(plugin) = self.plugins.remove(&id) {
-                        self.mark_stopping_and_unregister(&plugin);
+                        self.update_fabric_state(
+                            &plugin,
+                            FabricModuleState::Stopping,
+                        );
                         plugin.shutdown();
+                        self.unregister_from_fabric(
+                            plugin.plugin_id,
+                            plugin.fabric_registration_id,
+                        );
                     }
                 }
             }
